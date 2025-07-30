@@ -40,7 +40,121 @@ import (
 	"github.com/minio/warp/api"
 	"github.com/minio/warp/pkg/aggregate"
 	"github.com/minio/warp/pkg/bench"
+	"github.com/minio/warp/pkg/generator"
 )
+
+// SerializableObject represents an object that can be saved to/loaded from JSON
+type SerializableObject struct {
+	Name        string `json:"name"`
+	ContentType string `json:"content_type"`
+	Prefix      string `json:"prefix"`
+	VersionID   string `json:"version_id"`
+	Size        int64  `json:"size"`
+}
+
+// SerializableObjects represents a collection of serializable objects
+type SerializableObjects struct {
+	Objects map[string]SerializableObject `json:"objects"`
+}
+
+// saveObjectsToFile saves objects to a JSON file
+func saveObjectsToFile(objects generator.Objects, filename string) error {
+	serializable := SerializableObjects{
+		Objects: make(map[string]SerializableObject),
+	}
+
+	for _, obj := range objects {
+		serializable.Objects[obj.Name] = SerializableObject{
+			Name:        obj.Name,
+			ContentType: obj.ContentType,
+			Prefix:      obj.Prefix,
+			VersionID:   obj.VersionID,
+			Size:        obj.Size,
+		}
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(serializable)
+}
+
+// saveObjectsMapToFile saves objects map to a JSON file (for MixedDistribution)
+func saveObjectsMapToFile(objectsMap map[string]generator.Object, filename string) error {
+	serializable := SerializableObjects{
+		Objects: make(map[string]SerializableObject),
+	}
+
+	for _, obj := range objectsMap {
+		serializable.Objects[obj.Name] = SerializableObject{
+			Name:        obj.Name,
+			ContentType: obj.ContentType,
+			Prefix:      obj.Prefix,
+			VersionID:   obj.VersionID,
+			Size:        obj.Size,
+		}
+	}
+
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(serializable)
+}
+
+// loadObjectsFromFile loads objects from a JSON file into a MixedDistribution
+func loadObjectsFromFile(filename string, dist *bench.MixedDistribution) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var serializable SerializableObjects
+	decoder := json.NewDecoder(file)
+	err = decoder.Decode(&serializable)
+	if err != nil {
+		return err
+	}
+
+	// Create new objects map
+	objectsMap := make(map[string]generator.Object)
+
+	// Convert serializable objects back to generator.Objects
+	for _, sObj := range serializable.Objects {
+		obj := generator.Object{
+			Name:        sObj.Name,
+			ContentType: sObj.ContentType,
+			Prefix:      sObj.Prefix,
+			VersionID:   sObj.VersionID,
+			Size:        sObj.Size,
+			Reader:      nil, // Reader is always nil after uploads
+		}
+		objectsMap[obj.Name] = obj
+	}
+
+	// Use the new LoadObjectsMap method
+	dist.LoadObjectsMap(objectsMap)
+
+	// CRITICAL: Regenerate the operations distribution after loading objects
+	// The RegenerateOps method creates the ops slice that drives the benchmark
+	// without overwriting the objects we just loaded
+	err = dist.RegenerateOps()
+	if err != nil {
+		return fmt.Errorf("failed to regenerate operations: %w", err)
+	}
+
+	return nil
+}
 
 var benchFlags = []cli.Flag{
 	cli.StringFlag{
@@ -102,6 +216,16 @@ var benchFlags = []cli.Flag{
 		Usage:  "Add user tag to all objects using the format <key>=<value>. Random value can be set with 'rand:%length'. Can be used multiple times. Example: --tag foo=bar --tag randomValue=rand:1024.",
 		Hidden: true,
 	},
+	cli.StringFlag{
+		Name:  "stage",
+		Usage: "Only run specific stage: prepare, benchmark, or cleanup",
+		Value: "",
+	},
+	cli.StringFlag{
+		Name:  "objects-file",
+		Usage: "File to save/load object metadata when using --stage. Enables running prepare and benchmark as separate commands.",
+		Value: "",
+	},
 }
 
 // runBench will run the supplied benchmark and save/print the analysis.
@@ -124,6 +248,28 @@ func runBench(ctx *cli.Context, b bench.Benchmark) error {
 		fatalIf(probe.NewError(err), "Error running remote benchmark")
 		return nil
 	}
+
+	// Check for stage filtering
+	onlyStage := ctx.String("stage")
+	var runPrepare, runBenchmark, runCleanup bool
+
+	if onlyStage == "" {
+		// No stage specified, run all stages
+		runPrepare = true
+		runBenchmark = true
+		runCleanup = true
+	} else {
+		// Only run the specified stage
+		runPrepare = (onlyStage == stagePrepare.String())
+		runBenchmark = (onlyStage == stageBenchmark.String())
+		runCleanup = (onlyStage == stageCleanup.String())
+
+		// Validate stage name
+		if !runPrepare && !runBenchmark && !runCleanup {
+			fatalIf(probe.NewError(fmt.Errorf("invalid stage: %s. Valid stages are: prepare, benchmark, cleanup", onlyStage)), "Invalid stage")
+		}
+	}
+
 	var ui ui
 	if !globalQuiet && !globalJSON {
 		go ui.Run()
@@ -138,156 +284,226 @@ func runBench(ctx *cli.Context, b bench.Benchmark) error {
 	}, printError)
 	defer monitor.Done()
 
-	monitor.InfoLn("Preparing server")
-	c.Clear = !ctx.Bool("noclear")
-	if ctx.Bool("autoterm") {
-		c.AutoTermDur = ctx.Duration("autoterm.dur")
-		c.AutoTermScale = ctx.Float64("autoterm.pct") / 100
-	}
-	c.PrepareProgress = make(chan float64, 1)
-	ui.StartPrepare("Preparing", c.PrepareProgress, updates)
+	// PREPARE STAGE
+	if runPrepare {
+		monitor.InfoLn("Preparing server")
+		c.Clear = !ctx.Bool("noclear")
+		if ctx.Bool("autoterm") {
+			c.AutoTermDur = ctx.Duration("autoterm.dur")
+			c.AutoTermScale = ctx.Float64("autoterm.pct") / 100
+		}
+		c.PrepareProgress = make(chan float64, 1)
+		ui.StartPrepare("Preparing", c.PrepareProgress, updates)
 
-	err := b.Prepare(context.Background())
-	fatalIf(probe.NewError(err), "Error preparing server")
-	if c.PrepareProgress != nil {
-		close(c.PrepareProgress)
-	}
-
-	if ap, ok := b.(AfterPreparer); ok {
-		err := ap.AfterPrepare(context.Background())
+		err := b.Prepare(context.Background())
 		fatalIf(probe.NewError(err), "Error preparing server")
-	}
+		if c.PrepareProgress != nil {
+			close(c.PrepareProgress)
+		}
 
-	// Start after waiting a second or until we reached the start time.
-	tStart := time.Now().Add(time.Second * 3)
-	if st := ctx.String("syncstart"); st != "" {
-		startTime := parseLocalTime(st)
-		now := time.Now()
-		if startTime.Before(now) {
-			monitor.Errorln("Did not manage to prepare before syncstart")
-			tStart = time.Now()
-		} else {
-			tStart = startTime
+		if ap, ok := b.(AfterPreparer); ok {
+			err := ap.AfterPrepare(context.Background())
+			fatalIf(probe.NewError(err), "Error preparing server")
+		}
+
+		if onlyStage != "" {
+			// Save objects to file for Mixed benchmarks if objects-file is specified
+			if objFile := ctx.String("objects-file"); objFile != "" && ctx.Command.Name == "mixed" {
+				if mixedBench, ok := b.(*bench.Mixed); ok {
+					monitor.InfoLn("Saving object metadata to", objFile)
+					err := saveObjectsMapToFile(mixedBench.Dist.GetObjectsMap(), objFile)
+					if err != nil {
+						monitor.Errorln("Failed to save objects:", err)
+					} else {
+						monitor.InfoLn("Objects saved successfully")
+					}
+				}
+			}
+			monitor.InfoLn("Prepare stage completed.")
+			ui.Wait()
+			return nil
 		}
 	}
-	if u := ui.updates.Load(); u != nil {
-		*u <- aggregate.UpdateReq{Reset: true}
-	}
-	benchDur := ctx.Duration("duration")
-	ui.StartBenchmark("Benchmarking", tStart, tStart.Add(benchDur), updates)
-	ctx2, cancel := context.WithDeadline(context.Background(), tStart.Add(benchDur))
-	defer cancel()
-	ui.cancelFn.Store(&cancel)
-	start := make(chan struct{})
-	go func() {
-		monitor.InfoLn("Pausing before benchmark")
-		<-time.After(time.Until(tStart))
-		monitor.InfoLn("Press 'q' to abort benchmark and print partial results")
-		close(start)
-	}()
 
-	fileName := ctx.String("benchdata")
-	cID := pRandASCII(4)
-	if fileName == "" {
-		fileName = fmt.Sprintf("%s-%s-%s-%s", appName, ctx.Command.Name, time.Now().Format("2006-01-02[150405]"), cID)
-	}
+	// BENCHMARK STAGE
+	if runBenchmark {
+		// Load objects from file for Mixed benchmarks if objects-file is specified and running benchmark-only
+		if onlyStage == stageBenchmark.String() && ctx.String("objects-file") != "" && ctx.Command.Name == "mixed" {
+			if mixedBench, ok := b.(*bench.Mixed); ok {
+				objFile := ctx.String("objects-file")
+				monitor.InfoLn("Loading object metadata from", objFile)
+				err := loadObjectsFromFile(objFile, mixedBench.Dist)
+				if err != nil {
+					fatalIf(probe.NewError(err), "Failed to load objects from file")
+				} else {
+					monitor.InfoLn("Objects loaded successfully")
+				}
+			}
+		}
 
-	prof, err := startProfiling(ctx2, ctx)
-	fatalIf(probe.NewError(err), "Unable to start profile.")
-	monitor.InfoLn("Starting benchmark in", time.Until(tStart).Round(time.Second))
-	b.Start(ctx2, start)
-	c.Collector.Close()
-	cancel()
+		// Check if we're running benchmark-only for commands that need prepared objects
+		if onlyStage == stageBenchmark.String() {
+			cmdName := ctx.Command.Name
+			needsObjects := []string{"mixed", "get", "stat", "delete", "versioned"}
+			for _, needsObj := range needsObjects {
+				if cmdName == needsObj {
+					// Only show warning if objects-file is not specified for mixed benchmark
+					if cmdName == "mixed" && ctx.String("objects-file") != "" {
+						// Skip warning since we're loading objects from file
+						continue
+					}
+					monitor.InfoLn(fmt.Sprintf("Warning: Running '%s --stage benchmark' requires objects from the prepare stage.", cmdName))
+					monitor.InfoLn("Either run prepare stage first, or run without --stage to include all stages.")
+					monitor.InfoLn("If objects already exist, use --noclear flag to preserve them.")
+					if cmdName == "mixed" {
+						monitor.InfoLn("Alternatively, use --objects-file to save/load objects between prepare and benchmark stages.")
+					}
+				}
+			}
+		}
 
-	ctx2 = context.Background()
-	prof.stop(ctx2, ctx, fileName+".profiles.zip")
+		// Start after waiting a second or until we reached the start time.
+		tStart := time.Now().Add(time.Second * 3)
+		if st := ctx.String("syncstart"); st != "" {
+			startTime := parseLocalTime(st)
+			now := time.Now()
+			if startTime.Before(now) {
+				monitor.Errorln("Did not manage to prepare before syncstart")
+				tStart = time.Now()
+			} else {
+				tStart = startTime
+			}
+		}
+		if u := ui.updates.Load(); u != nil {
+			*u <- aggregate.UpdateReq{Reset: true}
+		}
+		benchDur := ctx.Duration("duration")
+		ui.StartBenchmark("Benchmarking", tStart, tStart.Add(benchDur), updates)
+		ctx2, cancel := context.WithDeadline(context.Background(), tStart.Add(benchDur))
+		defer cancel()
+		ui.cancelFn.Store(&cancel)
+		start := make(chan struct{})
+		go func() {
+			monitor.InfoLn("Pausing before benchmark")
+			<-time.After(time.Until(tStart))
+			monitor.InfoLn("Press 'q' to abort benchmark and print partial results")
+			close(start)
+		}()
 
-	// Previous context is canceled, create a new...
-	monitor.InfoLn("Saving benchmark data")
-	if ops := retrieveOps(); len(ops) > 0 {
-		ops.SortByStartTime()
-		ops.SetClientID(cID)
+		fileName := ctx.String("benchdata")
+		cID := pRandASCII(4)
+		if fileName == "" {
+			fileName = fmt.Sprintf("%s-%s-%s-%s", appName, ctx.Command.Name, time.Now().Format("2006-01-02[150405]"), cID)
+		}
 
-		if len(ops) > 0 {
-			f, err := os.Create(fileName + ".csv.zst")
+		prof, err := startProfiling(ctx2, ctx)
+		fatalIf(probe.NewError(err), "Unable to start profile.")
+		monitor.InfoLn("Starting benchmark in", time.Until(tStart).Round(time.Second))
+		b.Start(ctx2, start)
+		c.Collector.Close()
+		cancel()
+
+		ctx2 = context.Background()
+		prof.stop(ctx2, ctx, fileName+".profiles.zip")
+
+		// Previous context is canceled, create a new...
+		monitor.InfoLn("Saving benchmark data")
+		if ops := retrieveOps(); len(ops) > 0 {
+			ops.SortByStartTime()
+			ops.SetClientID(cID)
+
+			if len(ops) > 0 {
+				f, err := os.Create(fileName + ".csv.zst")
+				if err != nil {
+					monitor.Errorln("Unable to write benchmark data:", err)
+				} else {
+					func() {
+						defer f.Close()
+						enc, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
+						fatalIf(probe.NewError(err), "Unable to compress benchmark output")
+
+						defer enc.Close()
+						err = ops.CSV(enc, commandLine(ctx))
+						fatalIf(probe.NewError(err), "Unable to write benchmark output")
+
+						monitor.InfoLn(fmt.Sprintf("\nBenchmark data written to %q\n", fileName+".csv.zst"))
+					}()
+				}
+			}
+			monitor.OperationsReady(ops, fileName, commandLine(ctx))
+			var buf bytes.Buffer
+			printAnalysis(ctx, &buf, ops)
+			ui.Update(tea.Quit())
+			ui.Wait()
+			fmt.Println(buf.String())
+		} else if updates != nil {
+			finalCh := make(chan *aggregate.Realtime, 1)
+			updates <- aggregate.UpdateReq{Final: true, C: finalCh}
+			final := <-finalCh
+			final.Commandline = commandLine(ctx)
+			final.WarpVersion = GlobalVersion
+			final.WarpDate = GlobalDate
+			final.WarpCommit = GlobalCommit
+			f, err := os.Create(fileName + ".json.zst")
 			if err != nil {
 				monitor.Errorln("Unable to write benchmark data:", err)
 			} else {
 				func() {
 					defer f.Close()
 					enc, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-					fatalIf(probe.NewError(err), "Unable to compress benchmark output")
+					if err != nil {
+						monitor.Errorln("Unable to compress benchmark data:", err)
+					}
 
 					defer enc.Close()
-					err = ops.CSV(enc, commandLine(ctx))
-					fatalIf(probe.NewError(err), "Unable to write benchmark output")
+					js := json.NewEncoder(enc)
+					js.SetIndent("", "  ")
+					err = js.Encode(final)
+					if err != nil {
+						monitor.Errorln("Unable to write benchmark data:", err)
+					}
 
-					monitor.InfoLn(fmt.Sprintf("\nBenchmark data written to %q\n", fileName+".csv.zst"))
+					monitor.InfoLn(fmt.Sprintf("\nBenchmark data written to %q\n\n", fileName+".json.zst"))
 				}()
 			}
-		}
-		monitor.OperationsReady(ops, fileName, commandLine(ctx))
-		var buf bytes.Buffer
-		printAnalysis(ctx, &buf, ops)
-		ui.Update(tea.Quit())
-		ui.Wait()
-		fmt.Println(buf.String())
-	} else if updates != nil {
-		finalCh := make(chan *aggregate.Realtime, 1)
-		updates <- aggregate.UpdateReq{Final: true, C: finalCh}
-		final := <-finalCh
-		final.Commandline = commandLine(ctx)
-		final.WarpVersion = GlobalVersion
-		final.WarpDate = GlobalDate
-		final.WarpCommit = GlobalCommit
-		f, err := os.Create(fileName + ".json.zst")
-		if err != nil {
-			monitor.Errorln("Unable to write benchmark data:", err)
-		} else {
-			func() {
-				defer f.Close()
-				enc, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-				if err != nil {
-					monitor.Errorln("Unable to compress benchmark data:", err)
-				}
+			var rep *bytes.Buffer
+			if globalJSON {
+				rep = &bytes.Buffer{}
+				enc := json.NewEncoder(rep)
+				enc.SetIndent("", "  ")
+				_ = enc.Encode(final)
+			} else {
+				rep = final.Report(aggregate.ReportOptions{
+					Details: ctx.Bool("analyze.v"),
+					Color:   !globalNoColor,
+					OnlyOps: getAnalyzeOPS(ctx),
+				})
+			}
 
-				defer enc.Close()
-				js := json.NewEncoder(enc)
-				js.SetIndent("", "  ")
-				err = js.Encode(final)
-				if err != nil {
-					monitor.Errorln("Unable to write benchmark data:", err)
-				}
-
-				monitor.InfoLn(fmt.Sprintf("\nBenchmark data written to %q\n\n", fileName+".json.zst"))
-			}()
-		}
-		var rep *bytes.Buffer
-		if globalJSON {
-			rep = &bytes.Buffer{}
-			enc := json.NewEncoder(rep)
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(final)
-		} else {
-			rep = final.Report(aggregate.ReportOptions{
-				Details: ctx.Bool("analyze.v"),
-				Color:   !globalNoColor,
-				OnlyOps: getAnalyzeOPS(ctx),
-			})
+			monitor.UpdateAggregate(final, fileName)
+			ui.Update(tea.Quit())
+			ui.Wait()
+			fmt.Println("")
+			fmt.Println(rep)
 		}
 
-		monitor.UpdateAggregate(final, fileName)
-		ui.Update(tea.Quit())
-		ui.Wait()
-		fmt.Println("")
-		fmt.Println(rep)
+		if onlyStage != "" {
+			monitor.InfoLn("Benchmark stage completed.")
+			ui.Wait()
+			return nil
+		}
 	}
-	if !ctx.Bool("keep-data") && !ctx.Bool("noclear") {
-		ui.SetPhase("Cleanup")
-		monitor.InfoLn("Starting cleanup...")
-		b.Cleanup(context.Background())
+
+	// CLEANUP STAGE
+	if runCleanup {
+		if !ctx.Bool("keep-data") && !ctx.Bool("noclear") {
+			ui.SetPhase("Cleanup")
+			monitor.InfoLn("Starting cleanup...")
+			b.Cleanup(context.Background())
+		}
+		monitor.InfoLn("Cleanup Done.")
 	}
-	monitor.InfoLn("Cleanup Done.")
+
 	ui.Wait()
 	return nil
 }
@@ -391,14 +607,40 @@ const (
 	stageNotStarted benchmarkStage = ""
 )
 
+// String returns the string representation of the benchmark stage
+func (bs benchmarkStage) String() string {
+	return string(bs)
+}
+
 var benchmarkStages = []benchmarkStage{
 	stagePrepare, stageBenchmark, stageCleanup,
 }
 
 func runClientBenchmark(ctx *cli.Context, b bench.Benchmark, cb *clientBenchmark) error {
-	err := cb.waitForStage(stagePrepare)
-	if err != nil {
-		return err
+	// Load objects from file FIRST for Mixed benchmarks if objects-file is specified (client-server mode)
+	// This must happen before stage coordination begins
+	if objFile := ctx.String("objects-file"); objFile != "" && ctx.Command.Name == "mixed" {
+		if mixedBench, ok := b.(*bench.Mixed); ok {
+			console.Infoln("Loading object metadata from", objFile)
+			err := loadObjectsFromFile(objFile, mixedBench.Dist)
+			if err != nil {
+				console.Errorln("Failed to load objects:", err)
+				// Continue anyway - maybe objects were created locally during prepare
+			} else {
+				console.Infoln("Objects loaded successfully")
+			}
+		}
+	}
+
+	// Check if we're running benchmark-only stage
+	onlyStage := ctx.String("stage")
+	skipPrepare := (onlyStage == stageBenchmark.String())
+
+	if !skipPrepare {
+		err := cb.waitForStage(stagePrepare)
+		if err != nil {
+			return err
+		}
 	}
 
 	retrieveOps, updates := addCollector(ctx, b)
@@ -414,10 +656,25 @@ func runClientBenchmark(ctx *cli.Context, b bench.Benchmark, cb *clientBenchmark
 	cb.updates = updates
 	cb.Unlock()
 
-	err = b.Prepare(cb.info[stagePrepare].stageCtx)
-	cb.stageDone(stagePrepare, err, common.Custom)
-	if err != nil {
-		return err
+	if !skipPrepare {
+		err := b.Prepare(cb.info[stagePrepare].stageCtx)
+		cb.stageDone(stagePrepare, err, common.Custom)
+		if err != nil {
+			return err
+		}
+
+		// Save objects to file for Mixed benchmarks if objects-file is specified (client-server mode)
+		if objFile := ctx.String("objects-file"); objFile != "" && ctx.Command.Name == "mixed" {
+			if mixedBench, ok := b.(*bench.Mixed); ok {
+				console.Infoln("Saving object metadata to", objFile)
+				err := saveObjectsMapToFile(mixedBench.Dist.GetObjectsMap(), objFile)
+				if err != nil {
+					console.Errorln("Failed to save objects:", err)
+				} else {
+					console.Infoln("Objects saved successfully")
+				}
+			}
+		}
 	}
 
 	ctx2, cancel := benchStage.stageCtx, benchStage.cancelFn
@@ -453,7 +710,7 @@ func runClientBenchmark(ctx *cli.Context, b bench.Benchmark, cb *clientBenchmark
 		fileName = fmt.Sprintf("%s-%s-%s-%s", appName, ctx.Command.Name, time.Now().Format("2006-01-02[150405]"), cID)
 	}
 
-	err = b.Start(ctx2, start)
+	err := b.Start(ctx2, start)
 	ops := retrieveOps()
 	cb.Lock()
 	cb.results = ops
@@ -514,15 +771,20 @@ func runClientBenchmark(ctx *cli.Context, b bench.Benchmark, cb *clientBenchmark
 		}
 	}
 
-	err = cb.waitForStage(stageCleanup)
-	if err != nil {
-		return err
+	// Skip cleanup stage coordination if running benchmark-only
+	skipCleanup := (onlyStage == stageBenchmark.String())
+
+	if !skipCleanup {
+		err := cb.waitForStage(stageCleanup)
+		if err != nil {
+			return err
+		}
+		if !ctx.Bool("keep-data") && !ctx.Bool("noclear") {
+			console.Infoln("Starting cleanup...")
+			b.Cleanup(cb.info[stageCleanup].stageCtx)
+		}
+		cb.stageDone(stageCleanup, nil, common.Custom)
 	}
-	if !ctx.Bool("keep-data") && !ctx.Bool("noclear") {
-		console.Infoln("Starting cleanup...")
-		b.Cleanup(cb.info[stageCleanup].stageCtx)
-	}
-	cb.stageDone(stageCleanup, nil, common.Custom)
 
 	return nil
 }
@@ -643,6 +905,21 @@ func checkBenchmark(ctx *cli.Context) {
 		}
 		if ctx.Float64("autoterm.pct") <= 0 {
 			fatalIf(errDummy(), "autoterm.pct cannot be zero or negative")
+		}
+	}
+
+	// Validate stage flag
+	if stage := ctx.String("stage"); stage != "" {
+		validStages := []string{stagePrepare.String(), stageBenchmark.String(), stageCleanup.String()}
+		isValid := false
+		for _, validStage := range validStages {
+			if stage == validStage {
+				isValid = true
+				break
+			}
+		}
+		if !isValid {
+			fatalIf(errDummy(), "Invalid stage '%s'. Valid stages are: %v", stage, validStages)
 		}
 	}
 }

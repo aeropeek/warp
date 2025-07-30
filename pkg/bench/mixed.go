@@ -148,6 +148,53 @@ func (m *MixedDistribution) getOp() string {
 	return op
 }
 
+// GetObjectsMap returns a copy of the objects map for serialization
+func (m *MixedDistribution) GetObjectsMap() map[string]generator.Object {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	objectsCopy := make(map[string]generator.Object, len(m.objects))
+	for k, v := range m.objects {
+		objectsCopy[k] = v
+	}
+	return objectsCopy
+}
+
+// LoadObjectsMap loads objects from a map into the distribution
+func (m *MixedDistribution) LoadObjectsMap(objectsMap map[string]generator.Object) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objects = make(map[string]generator.Object, len(objectsMap))
+	for k, v := range objectsMap {
+		m.objects[k] = v
+	}
+}
+
+// RegenerateOps regenerates the operations list and RNG without affecting the objects map
+// This is needed when loading objects from file to ensure the distribution is properly initialized
+func (m *MixedDistribution) RegenerateOps() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	err := m.normalize()
+	if err != nil {
+		return err
+	}
+
+	const genOps = 1000
+	m.ops = make([]string, 0, genOps)
+	for op, dist := range m.Distribution {
+		add := int(0.5 + dist*genOps)
+		for i := 0; i < add; i++ {
+			m.ops = append(m.ops, op)
+		}
+	}
+	m.rng = rand.New(rand.NewSource(0xabad1dea))
+	m.rng.Shuffle(len(m.ops), func(i, j int) {
+		m.ops[i], m.ops[j] = m.ops[j], m.ops[i]
+	})
+	return nil
+}
+
 // Prepare will create an empty bucket or delete any content already there
 // and upload a number of objects.
 func (g *Mixed) Prepare(ctx context.Context) error {

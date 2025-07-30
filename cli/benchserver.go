@@ -196,152 +196,199 @@ func runServerBenchmark(ctx *cli.Context, b bench.Benchmark) (bool, error) {
 	ui.cancelFn.Store(&cancel)
 	defer cancel()
 
-	_ = conns.startStageAll(stagePrepare, time.Now().Add(time.Second), true)
-	err := conns.waitForStage(benchCtx, stagePrepare, true, common, nil)
-	if benchCtx.Err() != nil {
-		return true, benchCtx.Err()
-	}
-	if err != nil {
-		fatalIf(probe.NewError(err), "Failed to prepare")
-	}
-	if ap, ok := b.(AfterPreparer); ok {
-		err := ap.AfterPrepare(context.Background())
-		fatalIf(probe.NewError(err), "Error preparing server")
-	}
+	// Check for stage filtering (same logic as runBench)
+	onlyStage := ctx.String("stage")
+	var runPrepare, runBenchmark, runCleanup bool
 
-	infoLn("All clients prepared...")
+	if onlyStage == "" {
+		// No stage specified, run all stages
+		runPrepare = true
+		runBenchmark = true
+		runCleanup = true
+	} else {
+		// Only run the specified stage
+		runPrepare = (onlyStage == stagePrepare.String())
+		runBenchmark = (onlyStage == stageBenchmark.String())
+		runCleanup = (onlyStage == stageCleanup.String())
 
-	const benchmarkWait = 3 * time.Second
-	var updates chan aggregate.UpdateReq
-	if !ctx.Bool("full") {
-		updates = make(chan aggregate.UpdateReq, 10)
-		monitor.SetUpdate(updates)
-	}
-	prof, err := startProfiling(context.Background(), ctx)
-	if err != nil {
-		return true, err
-	}
-	tStart := time.Now().Add(benchmarkWait)
-	benchDur := ctx.Duration("duration")
-	err = conns.startStageAll(stageBenchmark, time.Now().Add(benchmarkWait), false)
-	if err != nil {
-		errorLn("Failed to start all clients", err)
-	}
-	ui.StartBenchmark("Benchmarking", tStart, tStart.Add(benchDur), updates)
-	ui.SetSubText("Press 'q' to abort benchmark and retrieve partial results")
-
-	if ctx.Bool("autoterm") {
-		if ctx.Bool("full") {
-			return true, errors.New("use of -autoterm cannot be combined with -full on remote benchmarks")
-		}
-		common.AutoTermDur = ctx.Duration("autoterm.dur")
-		common.AutoTermScale = ctx.Float64("autoterm.pct") / 100
-		if common.AutoTermDur > 0 {
-			benchCtx = aggregate.AutoTerm(benchCtx, "", common.AutoTermScale, int(common.AutoTermDur.Seconds()+0.999), common.AutoTermDur, updates)
+		// Validate stage name
+		if !runPrepare && !runBenchmark && !runCleanup {
+			return true, fmt.Errorf("invalid stage: %s. Valid stages are: prepare, benchmark, cleanup", onlyStage)
 		}
 	}
 
-	err = conns.waitForStage(benchCtx, stageBenchmark, false, common, updates)
-	if err != nil {
-		errorLn("Failed to keep connection to all clients", err)
+	// PREPARE STAGE
+	if runPrepare {
+		_ = conns.startStageAll(stagePrepare, time.Now().Add(time.Second), true)
+		err := conns.waitForStage(benchCtx, stagePrepare, true, common, nil)
+		if benchCtx.Err() != nil {
+			return true, benchCtx.Err()
+		}
+		if err != nil {
+			fatalIf(probe.NewError(err), "Failed to prepare")
+		}
+		if ap, ok := b.(AfterPreparer); ok {
+			err := ap.AfterPrepare(context.Background())
+			fatalIf(probe.NewError(err), "Error preparing server")
+		}
+
+		infoLn("All clients prepared...")
+
+		if onlyStage != "" {
+			infoLn("Prepare stage completed.")
+			return true, nil
+		}
 	}
 
-	fileName := ctx.String("benchdata")
-	if fileName == "" {
-		fileName = fmt.Sprintf("%s-%s-%s-%s", appName, "remote", time.Now().Format("2006-01-02[150405]"), pRandASCII(4))
-	}
-	prof.stop(context.Background(), ctx, fileName+".profiles.zip")
+	// BENCHMARK STAGE
+	if runBenchmark {
+		// If we skipped prepare stage, we still need to ensure clients are ready for benchmark
+		if !runPrepare {
+			infoLn("Initializing clients for benchmark stage...")
+			// Give clients time to load objects and initialize
+			time.Sleep(2 * time.Second)
+		}
 
-	ui.SetPhase("Downloading Operations")
-	if updates == nil {
-		downloaded := conns.downloadOps()
-		switch len(downloaded) {
-		case 0:
-		case 1:
-			allOps = downloaded[0]
-		default:
-			threads := uint16(0)
-			for _, ops := range downloaded {
-				threads = ops.OffsetThreads(threads)
-				allOps = append(allOps, ops...)
+		const benchmarkWait = 3 * time.Second
+		var updates chan aggregate.UpdateReq
+		if !ctx.Bool("full") {
+			updates = make(chan aggregate.UpdateReq, 10)
+			monitor.SetUpdate(updates)
+		}
+		prof, err := startProfiling(context.Background(), ctx)
+		if err != nil {
+			return true, err
+		}
+		tStart := time.Now().Add(benchmarkWait)
+		benchDur := ctx.Duration("duration")
+		err = conns.startStageAll(stageBenchmark, time.Now().Add(benchmarkWait), false)
+		if err != nil {
+			errorLn("Failed to start all clients", err)
+		}
+		ui.StartBenchmark("Benchmarking", tStart, tStart.Add(benchDur), updates)
+		ui.SetSubText("Press 'q' to abort benchmark and retrieve partial results")
+
+		if ctx.Bool("autoterm") {
+			if ctx.Bool("full") {
+				return true, errors.New("use of -autoterm cannot be combined with -full on remote benchmarks")
+			}
+			common.AutoTermDur = ctx.Duration("autoterm.dur")
+			common.AutoTermScale = ctx.Float64("autoterm.pct") / 100
+			if common.AutoTermDur > 0 {
+				benchCtx = aggregate.AutoTerm(benchCtx, "", common.AutoTermScale, int(common.AutoTermDur.Seconds()+0.999), common.AutoTermDur, updates)
 			}
 		}
 
-		if len(allOps) > 0 {
-			allOps.SortByStartTime()
-			f, err := os.Create(fileName + ".csv.zst")
+		err = conns.waitForStage(benchCtx, stageBenchmark, false, common, updates)
+		if err != nil {
+			errorLn("Failed to keep connection to all clients", err)
+		}
+
+		fileName := ctx.String("benchdata")
+		if fileName == "" {
+			fileName = fmt.Sprintf("%s-%s-%s-%s", appName, "remote", time.Now().Format("2006-01-02[150405]"), pRandASCII(4))
+		}
+		prof.stop(context.Background(), ctx, fileName+".profiles.zip")
+
+		ui.SetPhase("Downloading Operations")
+		if updates == nil {
+			downloaded := conns.downloadOps()
+			switch len(downloaded) {
+			case 0:
+			case 1:
+				allOps = downloaded[0]
+			default:
+				threads := uint16(0)
+				for _, ops := range downloaded {
+					threads = ops.OffsetThreads(threads)
+					allOps = append(allOps, ops...)
+				}
+			}
+
+			if len(allOps) > 0 {
+				allOps.SortByStartTime()
+				f, err := os.Create(fileName + ".csv.zst")
+				if err != nil {
+					errorLn("Unable to write benchmark data:", err)
+				} else {
+					func() {
+						defer f.Close()
+						enc, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
+						fatalIf(probe.NewError(err), "Unable to compress benchmark output")
+
+						defer enc.Close()
+						err = allOps.CSV(enc, commandLine(ctx))
+						fatalIf(probe.NewError(err), "Unable to write benchmark output")
+
+						infoLn(fmt.Sprintf("Benchmark data written to %q\n", fileName+".csv.zst"))
+					}()
+				}
+			}
+			monitor.OperationsReady(allOps, fileName, commandLine(ctx))
+			ui.Update(tea.Quit())
+			ui.Wait()
+			printAnalysis(ctx, os.Stdout, allOps)
+		} else {
+			final := conns.downloadAggr()
+			if final.Total.TotalRequests == 0 {
+				return true, errors.New("no operations received")
+			}
+			final.Commandline = commandLine(ctx)
+			final.WarpVersion = GlobalVersion
+			final.WarpDate = GlobalDate
+			final.WarpCommit = GlobalCommit
+			f, err := os.Create(fileName + ".json.zst")
 			if err != nil {
-				errorLn("Unable to write benchmark data:", err)
+				monitor.Errorln("Unable to write benchmark data:", err)
 			} else {
 				func() {
 					defer f.Close()
 					enc, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
 					fatalIf(probe.NewError(err), "Unable to compress benchmark output")
-
 					defer enc.Close()
-					err = allOps.CSV(enc, commandLine(ctx))
+					js := json.NewEncoder(enc)
+					js.SetIndent("", "  ")
+					err = js.Encode(final)
 					fatalIf(probe.NewError(err), "Unable to write benchmark output")
 
-					infoLn(fmt.Sprintf("Benchmark data written to %q\n", fileName+".csv.zst"))
+					monitor.InfoLn(fmt.Sprintf("Benchmark data written to %q\n", fileName+".json.zst"))
 				}()
 			}
+			rep := final.Report(aggregate.ReportOptions{
+				Details: ctx.Bool("analyze.v"),
+				Color:   !globalNoColor,
+				OnlyOps: getAnalyzeOPS(ctx),
+			})
+			monitor.UpdateAggregate(&final, fileName)
+			ui.Update(tea.Quit())
+			ui.Wait()
+			fmt.Println("")
+			fmt.Println(rep)
 		}
-		monitor.OperationsReady(allOps, fileName, commandLine(ctx))
-		ui.Update(tea.Quit())
-		ui.Wait()
-		printAnalysis(ctx, os.Stdout, allOps)
-	} else {
-		final := conns.downloadAggr()
-		if final.Total.TotalRequests == 0 {
-			return true, errors.New("no operations received")
-		}
-		final.Commandline = commandLine(ctx)
-		final.WarpVersion = GlobalVersion
-		final.WarpDate = GlobalDate
-		final.WarpCommit = GlobalCommit
-		f, err := os.Create(fileName + ".json.zst")
-		if err != nil {
-			monitor.Errorln("Unable to write benchmark data:", err)
-		} else {
-			func() {
-				defer f.Close()
-				enc, err := zstd.NewWriter(f, zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-				fatalIf(probe.NewError(err), "Unable to compress benchmark output")
-				defer enc.Close()
-				js := json.NewEncoder(enc)
-				js.SetIndent("", "  ")
-				err = js.Encode(final)
-				fatalIf(probe.NewError(err), "Unable to write benchmark output")
 
-				monitor.InfoLn(fmt.Sprintf("Benchmark data written to %q\n", fileName+".json.zst"))
-			}()
+		if onlyStage != "" {
+			infoLn("Benchmark stage completed.")
+			return true, nil
 		}
-		rep := final.Report(aggregate.ReportOptions{
-			Details: ctx.Bool("analyze.v"),
-			Color:   !globalNoColor,
-			OnlyOps: getAnalyzeOPS(ctx),
-		})
-		monitor.UpdateAggregate(&final, fileName)
-		ui.Update(tea.Quit())
-		ui.Wait()
-		fmt.Println("")
-		fmt.Println(rep)
 	}
 
-	if !ctx.Bool("keep-data") && !ctx.Bool("noclear") {
-		ui.SetPhase("Cleanup")
-		monitor.InfoLn("Starting cleanup...")
-		b.Cleanup(context.Background())
+	// CLEANUP STAGE
+	if runCleanup {
+		if !ctx.Bool("keep-data") && !ctx.Bool("noclear") {
+			ui.SetPhase("Cleanup")
+			monitor.InfoLn("Starting cleanup...")
+			b.Cleanup(context.Background())
 
-		err = conns.startStageAll(stageCleanup, time.Now(), false)
-		if err != nil {
-			errorLn("Failed to clean up all clients", err)
+			err := conns.startStageAll(stageCleanup, time.Now(), false)
+			if err != nil {
+				errorLn("Failed to clean up all clients", err)
+			}
+			err = conns.waitForStage(context.Background(), stageCleanup, false, common, nil)
+			if err != nil {
+				errorLn("Failed to keep connection to all clients", err)
+			}
+			infoLn("Cleanup done.\n")
 		}
-		err = conns.waitForStage(context.Background(), stageCleanup, false, common, nil)
-		if err != nil {
-			errorLn("Failed to keep connection to all clients", err)
-		}
-		infoLn("Cleanup done.\n")
 	}
 
 	return true, nil
